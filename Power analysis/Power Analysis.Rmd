@@ -1,0 +1,432 @@
+---
+title: "Power Analysis on the effect of social information timing"
+author: "Alan Novaes Tump"
+date: "11/19/2020"
+output: html_document
+---
+
+
+
+## This Mardown file contains the power analysis for the experiment on the effect of social information timing.
+
+### Summary
+
+This file performs a power analysis based on effect sizes retrieved from pilot data.
+It repeatedly simulates data sets containing confidence judgements with varying number of participants. The used predictors for the simulation were obtained by the statistical analysis of pilot data. The aim is to re-fit the simulated data sets and to find the number of participants which allows us to identify a credible effect in at least 80% of the repetitions. 
+This criterion is reaches with with data sets with at least 150 participants. 
+
+
+### How to do it
+
+First load packages and the pilot data. Then process and filter it:
+```{r initial_process,message=FALSE}
+
+
+setwd("S:/DDM/SI_timing/data_analysis") #my personal working directory. Change to yours
+#load packages 
+library(RWiener)
+library(parallel)
+library(dplyr)
+library(tidyr)
+library(brms)
+library(broom)
+library(purrr)
+library(furrr)
+library(grid)
+library(rstan)
+rstan_options(auto_write = TRUE) 
+
+
+
+
+inv.logit <- function(x){
+  exp(x)/(1+exp(x))
+}
+
+
+filename="LIONESS Results - SI_main_experiment - Final (update0505)_finalBatch.xlsx"
+
+source("sheetProcessor.R")
+source("excludingCases.R")
+
+#Additional filter not included in "excludignCases" (100% more than 90% of times + higher avg confidence in wrong responses)
+filterTooMuch100 <- finalSheet %>% group_by(playerNr) %>% filter(confidence==100)  %>% summarise(number100Responses = sum(confidence)/100) %>% filter(number100Responses>108) 
+
+finalSheet <- finalSheet %>% filter(!playerNr %in% filterTooMuch100$playerNr)
+
+finalSheet <- finalSheet %>% filter(!(playerNr==6 | playerNr==108 | playerNr==123))
+
+# make interaction variable
+finalSheet <- finalSheet %>% mutate(SIxValidity=case_when(SI_timing=="filler"~"xfiller",
+                                                          SI_timing=="no_SI"~"noSI",
+                                                          SI_timing=="early"&SI_validity=="correct"~"earlyCorrect",
+                                                          SI_timing=="early"&SI_validity=="wrong"~"earlyWrong",
+                                                          SI_timing=="late"&SI_validity=="correct"~"lateCorrect",
+                                                          SI_timing=="late"&SI_validity=="wrong"~"lateWrong"))
+
+
+model_data <-  finalSheet  %>% filter(SI_validity != "filler")
+model_data$SIxValidity <- factor(model_data$SIxValidity, levels = c("noSI", "earlyCorrect", "earlyWrong", "lateCorrect", "lateWrong"))
+
+
+
+```
+
+Next we load the statistical model which contains the effect sizes the power analysis is based on. Thus, where effects of early/late, color, time, and correct/wrong information are estimated.
+Additionally, we also use the estimated individual differences measured by the model:
+
+
+```{r pressure,message=FALSE}
+model <- brm(file = "finalModelNew")
+
+
+
+#get the effect sizes
+effect_sizes = model %>% posterior_samples(pars=c("SIxValidityearlyCorrect","SIxValiditylateCorrect", "SIxValidityearlyWrong","SIxValiditylateWrong")) %>% 
+  mutate (diffCorrect = b_SIxValidityearlyCorrect-b_SIxValiditylateCorrect,diffWrong = b_SIxValidityearlyWrong-b_SIxValiditylateWrong) %>% 
+gather("parameter",samples)%>%   filter(parameter=="diffCorrect" | parameter=="diffWrong") %>%
+group_by(parameter) %>% summarise(estimate =mean(samples),lower=quantile(samples,prob=0.025),upper=quantile(samples,prob=0.975))
+
+
+```
+
+
+To conduct the power analysis we first need a function which simulates the data:
+
+```{r sim,suppressWarnings=TRUE,warning = FALSE,message=FALSE}
+
+
+sim_data<-function(standard_data,model,seed,n,effect_size){
+  set.seed(seed) #set a seed
+estimates=data.frame(t(fixef(model))) #get estimated effects
+standard_data = standard_data %>% mutate(shifts = (SIxValidity=="earlyCorrect") * estimates$SIxValidityearlyCorrect[1] +
+                                             (SIxValidity=="earlyWrong") * estimates$SIxValidityearlyWrong[1] +
+                                             (SIxValidity=="lateCorrect") * estimates$SIxValiditylateCorrect[1] +
+                                             (SIxValidity=="lateWrong") * estimates$SIxValiditylateWrong[1] + 
+                                             (difficulty=="hard") * estimates$difficultyhard[1] +
+                                             (dominantColour=="orange") * estimates$dominantColourorange[1] +
+                                             period * estimates$period[1])  #calculate the trial level effects
+  
+
+
+
+  
+measured_sd = sd(data.frame(ranef(model))[,1] )  #the measured individual differences
+ind_diff = rnorm(n,0,measured_sd) #simulated ind differences
+
+
+emprical_data_full =NULL
+for (ind in 1:n){
+  x= t(matrix(c(fixef(model)[1:10,1])  + ind_diff[ind],10,100)) - standard_data$shifts
+  probs= t(apply(  inv.logit(cbind(rep(-Inf,100),x,rep(100,100))),1,diff))
+ #apply(probs,1,sum) #check. should be a lot of ones
+ standard_data$confidenceScaled2 = apply(probs,1,sample,size=1,x=c(1:11),replace=F  )
+  standard_data$playerNr=ind
+  
+  emprical_data_full = rbind(emprical_data_full,standard_data)
+}
+return(emprical_data_full)
+}
+
+```
+
+
+
+
+Lets have  a first look at the model fit with 20 simulated participants:
+```{r check,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+standard_data = model_data %>% filter(playerNr==1) %>%  select(playerNr,period,SI_timing,SI_validity,SIxValidity,difficulty,dominantColour) # set of choices to build on
+
+seed = 1
+n = 20
+effect_size=NA
+
+fake_data<-sim_data(standard_data,model,seed,n,effect_size)
+
+
+fit <- brm(confidenceScaled2 ~ SIxValidity + difficulty + dominantColour + period + (1|playerNr),
+                     data=fake_data,
+                     cumulative("logit"),
+                     chains = 4,
+                     inits = 0,
+                     iter=1000,
+                     cores = 4 ,seed = seed,refresh = 0, file = paste0("brms_files/n",n,"_seed",seed))
+
+
+
+
+
+fit %>% posterior_samples(pars=c("SIxValidityearlyCorrect","SIxValiditylateCorrect", "SIxValidityearlyWrong","SIxValiditylateWrong")) %>% 
+  mutate (diffCorrect = b_SIxValidityearlyCorrect-b_SIxValiditylateCorrect,diffWrong = b_SIxValidityearlyWrong-b_SIxValiditylateWrong) %>% 
+gather("parameter",samples)%>%   filter(parameter=="diffCorrect" | parameter=="diffWrong") %>%
+group_by(parameter) %>% summarise(estimate =mean(samples),lower=quantile(samples,prob=0.025),upper=quantile(samples,prob=0.975)) %>%
+  ggplot(aes(x = factor(seed), y = estimate, ymin = lower, ymax = upper,color=parameter, group=parameter)) +
+  geom_hline(yintercept = c(0), color = "black") + 
+  geom_pointrange(fatten = 1/2,position = position_dodge(width = 0.2)) +
+  geom_point(position = position_dodge(width = 0.2)) +
+  labs(x = "seed (i.e., simulation index)",
+       y = "Difference") +geom_hline(yintercept = effect_sizes$estimate,color=c("red","blue"),linetype=2)+ scale_color_discrete(
+                       name="Effect size\n(early - late)",
+                       breaks=c("diffWrong", "diffCorrect"),
+                       labels=c("Wrong SI", "Correct SI"))
+
+
+```
+Above you can see the 95% posterior intervals for the estimated difference between early and late for correct and wrong social information (i.e early - late). 
+For correct it should be positive (early correct information has a stronger influence) and for wrong it should be negative.
+Both overlap with 0 indicating the number of participants is too low to find a credible effect.       
+But we might also only have bad luck. Let's try to repeat the simulaiton several times to account for stochastic effects.
+
+```{r check2,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+get_summuary <- function(fit){ # a funciton which allows me to grab the summary from a brms model. 
+  fit %>% posterior_samples(pars=c("SIxValidityearlyCorrect","SIxValiditylateCorrect", "SIxValidityearlyWrong","SIxValiditylateWrong")) %>% 
+  mutate (diffCorrect = b_SIxValidityearlyCorrect-b_SIxValiditylateCorrect,diffWrong = b_SIxValidityearlyWrong-b_SIxValiditylateWrong) %>% 
+gather("parameter",samples)%>%   filter(parameter=="diffCorrect" | parameter=="diffWrong") %>%
+group_by(parameter) %>% summarise(estimate =mean(samples),lower=quantile(samples,prob=0.025),upper=quantile(samples,prob=0.975))
+}
+
+
+plot_rhats <- function(s){ 
+rhats = s %>% 
+  mutate(rhat = map(fit, rhat)) %>% 
+  unnest(rhat) 
+rhats %>%  ggplot(aes(x = rhat)) +
+  geom_histogram(bins = 20) + scale_x_log10()  + geom_text(aes(label=paste0("% converged: ",round(mean(rhats$rhat<1.05,na.rm=T)*100,2)), x=mean(c(min(rhat,na.rm=T),max(rhat,na.rm=T))),  y=n_sim*20))}
+
+
+options(mc.cores = 30)
+plan(multiprocess)
+
+# how many simulations would you like?
+n_sim <- 250
+
+# this will help us track time
+t1 <- Sys.time()
+
+# here's the main event!
+s <-
+  tibble(seed = 1:n_sim) %>% 
+  mutate(d    = future_map(seed, sim_data, n = n,standard_data=standard_data,model=model,effect_size=NA)) %>% 
+  mutate(fit  = future_map2(d, seed, ~update(fit, newdata = .x, seed = .y, file = paste0("brms_files/n",n,"_seed",.y)))) #make map2 parallel, only run on cluster
+t2 <- Sys.time()
+
+
+rhats = s %>% mutate(rhat = map(fit, rhat)) %>% unnest(rhat)  %>% select(rhat)
+converged =  round(mean(rhats$rhat<1.05,na.rm=T)*100,2)
+```
+
+
+We can look at all r_hats as an indication if the chains converged. Apparently `r converged`% of the chains converges which is good:
+
+
+
+```{r check2_rhat,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+
+plot_rhats(s)
+```
+
+
+Now lets look at the found posterior of the effect sizes:
+```{r check2_plot,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% ggplot(aes(x = seed, y = estimate, ymin = lower, ymax = upper,color=parameter, group=parameter)) +
+  geom_hline(yintercept = c(0), color = "black") +
+  geom_pointrange(fatten = 1/2,position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  labs(x = "seed (i.e., simulation index)",
+       y = "Difference") +geom_hline(yintercept = effect_sizes$estimate,color=c("red","blue"),linetype=2)+ scale_color_discrete(
+                       name="Effect size\n(early - late)",
+                       breaks=c("diffWrong", "diffCorrect"),
+                       labels=c("Wrong SI", "Correct SI"))
+
+
+
+
+```
+We can also check the power:
+
+```{r check3,suppressWarnings=TRUE}
+
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% group_by(parameter) %>% summarise(power=mean(ifelse(parameter=="diffCorrect", -lower,upper)<0))
+
+
+```
+
+
+This is not enough. A good bench-line is 0.8.
+
+Lets try with 100 participants:
+
+
+```{r check4,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+
+n=100 
+
+# how many simulations would you like?
+
+# this will help us track time
+t1 <- Sys.time()
+
+# here's the main event!
+s <-
+  tibble(seed = 1:n_sim) %>% 
+  mutate(d    = future_map(seed, sim_data, n = n,standard_data=standard_data,model=model,effect_size=NA)) %>% 
+  mutate(fit  = future_map2(d, seed, ~update(fit, newdata = .x, seed = .y, file = paste0("brms_files/n",n,"_seed",.y)))) #make map2 
+t2 <- Sys.time()
+
+
+
+plot_rhats(s)
+
+
+
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% ggplot(aes(x = seed, y = estimate, ymin = lower, ymax = upper,color=parameter, group=parameter)) +
+  geom_hline(yintercept = c(0), color = "black") +
+  geom_pointrange(fatten = 1/2,position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  labs(x = "seed (i.e., simulation index)",
+       y = "Difference") +geom_hline(yintercept = effect_sizes$estimate,color=c("red","blue"),linetype=2)
+
+
+
+
+```
+
+```{r mcheck3,suppressWarnings=TRUE}
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% 
+  group_by(parameter) %>% summarise(power=mean(ifelse(parameter=="diffCorrect", -lower,upper)<0))
+
+````
+
+
+OK, interestingly 100 people are also not enough. This indicates we were a bit lucky to find the effect in the pilot. 
+It is noteworthy that the posterior for wrong social information is larger then for correct information. The reason is that the provided social information was correct in 70% of trials. Thus, the data contains more than twice as many trials with correct than wrong information. 
+Let's increase the number of participants further.
+
+
+
+
+```{r check6,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+
+n=150 
+
+# how many simulations would you like?
+
+# this will help us track time
+t1 <- Sys.time()
+
+# here's the main event!
+s <-
+  tibble(seed = 1:n_sim) %>% 
+  mutate(d    = future_map(seed, sim_data, n = n,standard_data=standard_data,model=model,effect_size=NA)) %>% 
+  mutate(fit  = future_map2(d, seed, ~update(fit, newdata = .x, seed = .y, file = paste0("brms_files/n",n,"_seed",.y)))) #make map2 
+t2 <- Sys.time()
+
+
+
+plot_rhats(s)
+
+
+
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% ggplot(aes(x = seed, y = estimate, ymin = lower, ymax = upper,color=parameter, group=parameter)) +
+  geom_hline(yintercept = c(0), color = "black") +
+  geom_pointrange(fatten = 1/2,position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  labs(x = "seed (i.e., simulation index)",
+       y = "Difference") +geom_hline(yintercept = effect_sizes$estimate,color=c("red","blue"),linetype=2)+ scale_color_discrete(
+                       name="Effect size\n(early - late)",
+                       breaks=c("diffWrong", "diffCorrect"),
+                       labels=c("Wrong SI", "Correct SI"))
+
+
+
+
+```
+
+```{r mcheck6,suppressWarnings=TRUE}
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% group_by(parameter) %>% summarise(power=mean(ifelse(parameter=="diffCorrect", -lower,upper)<0))
+
+
+
+````
+ 
+With a data sets containing 150 simulated participants the statistical model is able to identify in at least 80% if the repetitions a credible effect for correct and wrong information.
+ 
+```{r mcheck7,suppressWarnings=TRUE, echo=FALSE}
+ 
+dummy = s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% mutate(c=ifelse(parameter=="diffCorrect", -lower,upper)<0) %>% group_by(seed) %>% summarise(double_power=mean(c))
+
+````
+
+However, keep in mind that the likelihood to find both effect being credible is still only `r mean(dummy$double_power==1)*100`%.
+
+What happens with 200 particiants?
+
+```{r check8,suppressWarnings=TRUE,warning = FALSE,message=FALSE, fig.width=12, fig.height=7,results="hide"}
+
+
+n=200 
+
+# how many simulations would you like?
+
+# this will help us track time
+t1 <- Sys.time()
+
+# here's the main event!
+s <-
+  tibble(seed = 1:n_sim) %>% 
+  mutate(d    = future_map(seed, sim_data, n = n,standard_data=standard_data,model=model,effect_size=NA)) %>% 
+  mutate(fit  = future_map2(d, seed, ~update(fit, newdata = .x, seed = .y, file = paste0("brms_files/n",n,"_seed",.y)))) #make map2 
+t2 <- Sys.time()
+
+
+
+plot_rhats(s)
+
+
+
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% ggplot(aes(x = seed, y = estimate, ymin = lower, ymax = upper,color=parameter, group=parameter)) +
+  geom_hline(yintercept = c(0), color = "black") +
+  geom_pointrange(fatten = 1/2,position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  labs(x = "seed (i.e., simulation index)",
+       y = "Difference") +geom_hline(yintercept = effect_sizes$estimate,color=c("red","blue"),linetype=2)+ scale_color_discrete(
+                       name="Effect size\n(early - late)",
+                       breaks=c("diffWrong", "diffCorrect"),
+                       labels=c("Wrong SI", "Correct SI"))
+
+
+
+
+```
+Again each effects exceed the 80% threshold:
+
+```{r mcheck62,suppressWarnings=TRUE}
+
+s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% group_by(parameter) %>% summarise(power=mean(ifelse(parameter=="diffCorrect", -lower,upper)<0))
+
+
+
+````
+
+
+```{r mcheck9,suppressWarnings=TRUE, echo=FALSE}
+ 
+dummy = s %>% mutate(samples=map(fit,   get_summuary)) %>% unnest(samples) %>% mutate(c=ifelse(parameter=="diffCorrect", -lower,upper)<0) %>% group_by(seed) %>% summarise(double_power=mean(c))
+
+````
+
+But now with 200 participants, also the likelihood to find both effect being credible is with `r mean(dummy$double_power==1)*100`% above the threshold.
+
+
